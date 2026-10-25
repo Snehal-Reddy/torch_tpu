@@ -36,6 +36,7 @@
 #include "csrc/common/device_type.h"
 #include "csrc/common/dimension_types.h"
 #include "csrc/common/error_utils.h"
+#include "csrc/common/layout_utils.h"
 #include "csrc/eager/device_buffer.h"
 #include "csrc/eager/structured_log_buffer.h"
 #include "csrc/eager/tensor_to_buffer.h"
@@ -194,6 +195,21 @@ absl::StatusOr<int64_t> GetSizePerMajorDim(const xla::Shape& shape,
   return 0;
 }
 
+absl::Status ValidateContiguousBase(const at::Tensor& tpu_tensor) {
+  TT_ASSIGN_OR_RETURN(DeviceBufferRef base_buffer_ref,
+                      GetBaseBuffer(tpu_tensor));
+  TT_ASSIGN_OR_RETURN(const TpuLayout tpu_layout, ResolveTpuLayout(tpu_tensor));
+  TT_RET_CHECK(!tpu_tensor.is_conj() && !tpu_tensor.is_neg() &&
+                   tpu_tensor.is_contiguous() &&
+                   tpu_tensor.storage_offset() == 0 &&
+                   tpu_layout.sizes == base_buffer_ref.dimensions() &&
+                   tpu_layout.element_type == base_buffer_ref.element_type(),
+               error::kInvalidArgument)
+      << "destination TPU tensor must be a contiguous base tensor (non-base "
+         "views are not supported by BatchTransferH2D)";
+  return absl::OkStatus();
+}
+
 absl::StatusOr<DeviceBufferRef> GetPjrtBuffer(const at::Tensor& tpu_tensor,
                                               xla::PjRtBuffer*& out_buffer) {
   TT_RET_CHECK(tpu_tensor.device().type() == GetPrivateUse1DeviceType(),
@@ -311,6 +327,7 @@ BatchTransferD2H(  // NOLINT(readability-function-cognitive-complexity)
   std::vector<std::shared_ptr<RawBufferHolder>> batch_c_api_holds;
   std::vector<std::shared_ptr<void>> batch_holds;
   batch_c_api_holds.reserve(n);
+  batch_holds.reserve(n);
 
   // Step 7: Loop over all tensors in the batch and issue copies.
   for (size_t layer_idx = 0; layer_idx < n; ++layer_idx) {
@@ -325,14 +342,16 @@ BatchTransferD2H(  // NOLINT(readability-function-cognitive-complexity)
 
     // Step 7a: Materialize current tensor.
     auto start_mat_loop = std::chrono::high_resolution_clock::now();
-    xla::PjRtBuffer* src_buffer = nullptr;
-    TT_ASSIGN_OR_RETURN(DeviceBufferRef src_buffer_ref,
-                        GetPjrtBuffer(src, src_buffer));
-    TT_RET_CHECK(src_buffer->on_device_shape() == shape,
-                 error::kInvalidArgument)
-        << "Tensor at index " << layer_idx << " has shape "
-        << src_buffer->on_device_shape().ToString()
-        << " which is different from expected shape " << shape.ToString();
+    xla::PjRtBuffer* src_buffer = first_buffer;
+    DeviceBufferRef src_buffer_ref = first_buffer_ref;
+    if (layer_idx > 0) {
+      TT_ASSIGN_OR_RETURN(src_buffer_ref, GetPjrtBuffer(src, src_buffer));
+      TT_RET_CHECK(src_buffer->on_device_shape() == shape,
+                   error::kInvalidArgument)
+          << "Tensor at index " << layer_idx << " has shape "
+          << src_buffer->on_device_shape().ToString()
+          << " which is different from expected shape " << shape.ToString();
+    }
     // The raw PJRT copy API does not chain on buffer readiness, so we must wait
     // here for the producing computation to commit its result before issuing
     // the DMA.
@@ -437,6 +456,7 @@ BatchTransferH2D(  // NOLINT(readability-function-cognitive-complexity)
   if (src_arrs.empty()) return acc;
 
   // Extract metadata from the first tensor.
+  TT_RETURN_IF_ERROR(ValidateContiguousBase(dst_arrs[0]));
   xla::PjRtBuffer* first_buffer = nullptr;
   TT_ASSIGN_OR_RETURN(DeviceBufferRef first_buffer_ref,
                       GetPjrtBuffer(dst_arrs[0], first_buffer));
@@ -504,6 +524,7 @@ BatchTransferH2D(  // NOLINT(readability-function-cognitive-complexity)
   std::vector<std::shared_ptr<RawBufferHolder>> batch_c_api_holds;
   std::vector<std::shared_ptr<void>> batch_holds;
   batch_c_api_holds.reserve(n);
+  batch_holds.reserve(n);
 
   for (size_t layer_idx = 0; layer_idx < n; ++layer_idx) {
     const at::Tensor& src = src_arrs[layer_idx];
@@ -515,14 +536,17 @@ BatchTransferH2D(  // NOLINT(readability-function-cognitive-complexity)
     size_t src_size = src.nbytes();
     const uint8_t* src_data = reinterpret_cast<const uint8_t*>(src.data_ptr());
 
-    xla::PjRtBuffer* dst_buffer = nullptr;
-    TT_ASSIGN_OR_RETURN(DeviceBufferRef dst_buffer_ref,
-                        GetPjrtBuffer(dst, dst_buffer));
-    TT_RET_CHECK(dst_buffer->on_device_shape() == shape,
-                 error::kInvalidArgument)
-        << "Tensor at index " << layer_idx << " has shape "
-        << dst_buffer->on_device_shape().ToString()
-        << " which is different from expected shape " << shape.ToString();
+    xla::PjRtBuffer* dst_buffer = first_buffer;
+    DeviceBufferRef dst_buffer_ref = first_buffer_ref;
+    if (layer_idx > 0) {
+      TT_RETURN_IF_ERROR(ValidateContiguousBase(dst));
+      TT_ASSIGN_OR_RETURN(dst_buffer_ref, GetPjrtBuffer(dst, dst_buffer));
+      TT_RET_CHECK(dst_buffer->on_device_shape() == shape,
+                   error::kInvalidArgument)
+          << "Tensor at index " << layer_idx << " has shape "
+          << dst_buffer->on_device_shape().ToString()
+          << " which is different from expected shape " << shape.ToString();
+    }
     // The raw PJRT copy API does not chain on buffer readiness; the destination
     // buffer's ready future signals that it is safe to write into.
     TT_RETURN_IF_ERROR(dst_buffer->GetReadyFuture().Await());
@@ -575,6 +599,9 @@ BatchTransferH2D(  // NOLINT(readability-function-cognitive-complexity)
         batch_futures.push_back(std::move(future));
       }
     }
+    // Keep the DeviceBufferRef alive until the transfer completes.
+    batch_holds.push_back(
+        std::make_shared<DeviceBufferRef>(std::move(dst_buffer_ref)));
   }
 
   // Combine the tensor arrays for keeping them alive.

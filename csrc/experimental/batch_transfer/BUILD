@@ -33,6 +33,7 @@ torch_tpu_cc_library(
         "//csrc/common:device_type",
         "//csrc/common:dimension_types",
         "//csrc/common:error_utils",
+        "//csrc/common:layout_utils",
         "//csrc/eager:device_buffer",
         "//csrc/eager:structured_log_buffer",
         "//csrc/eager:tensor_to_buffer",
