@@ -289,8 +289,6 @@ xla::Future<void> TpuMemcpyDtoHDirect(const DeviceBufferRef& buffer_ref,
   return chained_future;
 }
 
-namespace {
-
 // RAII management holder for a PjRt RawBuffer alias and its underlying
 // DeviceBufferRef.
 //
@@ -300,65 +298,51 @@ namespace {
 // 1. The underlying DeviceBufferRef and its PjRtBuffer remain alive and
 // referenced until the DMA completes.
 // 2. When the last reference to this holder is dropped, the PJRT_RawBuffer
-// alias is cleanly destroyed via
-//    the PjRt C API extension.
-struct RawBufferHolder {
+// alias is cleanly destroyed via the PjRt C API extension BEFORE
+// device_buffer_ref is destroyed.
+struct PreparedRawDmaBuffer::Holder {
   // Global PjRt C API function table pointer.
   const PJRT_Api* c_api{nullptr};
   // PjRt RawBuffer extension function table pointer.
   const PJRT_RawBuffer_Extension* extension{nullptr};
   // Handle to the active raw buffer alias on the TPU device.
-  PJRT_RawBuffer* buffer{nullptr};
+  PJRT_RawBuffer* raw_buffer{nullptr};
   // Reference-counted handle holding the underlying PyTorch TPU DeviceBuffer
   // alive.
-  DeviceBufferRef device_buffer_ref;
+  DeviceBufferRef buffer_ref;
+  // Underlying PjRtBuffer pointer (valid as long as buffer_ref is alive).
+  xla::PjRtBuffer* pjrt_buffer{nullptr};
 
-  RawBufferHolder(const PJRT_Api* api, const PJRT_RawBuffer_Extension* ext,
-                  PJRT_RawBuffer* buf, DeviceBufferRef ref)
+  Holder(const PJRT_Api* api, const PJRT_RawBuffer_Extension* ext,
+         PJRT_RawBuffer* buf, DeviceBufferRef ref, xla::PjRtBuffer* pjrt_buf)
       : c_api(api),
         extension(ext),
-        buffer(buf),
-        device_buffer_ref(std::move(ref)) {}
+        raw_buffer(buf),
+        buffer_ref(std::move(ref)),
+        pjrt_buffer(pjrt_buf) {}
 
-  RawBufferHolder(const RawBufferHolder&) = delete;
-  RawBufferHolder& operator=(const RawBufferHolder&) = delete;
+  Holder(const Holder&) = delete;
+  Holder& operator=(const Holder&) = delete;
 
-  ~RawBufferHolder() {
-    // Release the PjRt raw buffer alias upon completion / destruction.
-    if (buffer && c_api && extension && extension->PJRT_RawBuffer_Destroy) {
+  ~Holder() {
+    // Release the PjRt raw buffer alias BEFORE buffer_ref member destruction.
+    if (raw_buffer && c_api && extension && extension->PJRT_RawBuffer_Destroy) {
       PJRT_RawBuffer_Destroy_Args args;
       args.struct_size = PJRT_RawBuffer_Destroy_Args_STRUCT_SIZE;
       args.extension_start = nullptr;
-      args.buffer = buffer;
+      args.buffer = raw_buffer;
       pjrt::LogFatalIfPjrtError(extension->PJRT_RawBuffer_Destroy(&args),
                                 c_api);
     }
   }
 };
 
-// Context structure bundling all components required to initiate and track a
-// raw DMA transfer.
-struct RawBufferContext {
-  // PjRt C API function table.
-  const PJRT_Api* c_api{nullptr};
-  // PjRt RawBuffer extension function table for DMA copy calls.
-  const PJRT_RawBuffer_Extension* extension{nullptr};
-  // Raw buffer handle passed to CopyRawDeviceToHost or CopyRawHostToDevice.
-  PJRT_RawBuffer* raw_buffer{nullptr};
-  // RAII hold object to be retained alongside the returned xla::Future<>.
-  std::shared_ptr<RawBufferHolder> hold;
-};
-
-// Prepares a DeviceBufferRef for zero-copy DMA by:
-// 1. Awaiting the PjRtBuffer to ensure pending device operations have
-// finished.
-// 2. Extracting the PjRt C API client and querying the
-// PJRT_RawBuffer_Extension.
-// 3. Creating a raw buffer alias of the underlying TPU device buffer.
-// 4. Wrapping the alias in a RawBufferHolder to guarantee lifetime safety
-// during async DMA.
-absl::StatusOr<RawBufferContext> PrepareRawBuffer(
+absl::StatusOr<PreparedRawDmaBuffer> PreparedRawDmaBuffer::Prepare(
     const DeviceBufferRef& buffer_ref) {
+  TT_RET_CHECK(buffer_ref.device_buffer_list() != nullptr,
+               error::kInvalidArgument)
+      << "Invalid DeviceBufferRef.";
+
   // Await the PjRtBuffer from the reference and verify computation readiness.
   TT_ASSIGN_OR_RETURN(xla::PjRtBuffer * buffer, buffer_ref.AwaitBuffer());
   TT_RETURN_IF_ERROR(
@@ -372,6 +356,9 @@ absl::StatusOr<RawBufferContext> PrepareRawBuffer(
       << "Expected PjRtCApiBuffer.";
 
   const PJRT_Api* c_api = capi_buffer->pjrt_c_api();
+  TT_RET_CHECK(  // ERROR_COV_INFEASIBLE=initialization condition
+      c_api != nullptr, error::kInternal)
+      << "PJRT C API not found.";
   auto* capi_client = dynamic_cast<xla::PjRtCApiClient*>(capi_buffer->client());
   TT_RET_CHECK(  // ERROR_COV_INFEASIBLE=initialization condition
       capi_client != nullptr, error::kInvalidArgument)
@@ -404,71 +391,129 @@ absl::StatusOr<RawBufferContext> PrepareRawBuffer(
                          "Failed to create raw alias of buffer");
   }
 
-  PJRT_RawBuffer* c_raw_buffer = create_args.raw_buffer;
-
-  // Package the raw buffer alias into an RAII holder to prevent premature
-  // deallocation.
-  auto hold = std::make_shared<RawBufferHolder>(c_api, extension, c_raw_buffer,
-                                                buffer_ref);
-  return RawBufferContext{c_api, extension, c_raw_buffer, std::move(hold)};
+  auto holder = std::make_shared<Holder>(
+      c_api, extension, create_args.raw_buffer, buffer_ref, buffer);
+  return PreparedRawDmaBuffer(std::move(holder));
 }
 
-}  // namespace
+const xla::Shape& PreparedRawDmaBuffer::on_device_shape() const {
+  ABSL_CHECK(holder_ != nullptr &&
+             holder_->pjrt_buffer != nullptr);  // CRASH_OK
+  return holder_->pjrt_buffer->on_device_shape();
+}
 
-absl::StatusOr<AsyncDmaResult> TpuAsyncDmaCopyDtoH(
-    const DeviceBufferRef& src_buffer_ref, void* dst_host_ptr,
-    int64_t copy_bytes) {
-  TT_ASSIGN_OR_RETURN(auto ctx, PrepareRawBuffer(src_buffer_ref));
+absl::StatusOr<size_t> PreparedRawDmaBuffer::GetOnDeviceSizeInBytes() const {
+  TT_RET_CHECK(holder_ != nullptr && holder_->pjrt_buffer != nullptr,
+               error::kFailedPrecondition)
+      << "PreparedRawDmaBuffer is not initialized.";
+  return AdaptXlaError(holder_->pjrt_buffer->GetOnDeviceSizeInBytes(),
+                       "Failed to get on-device size in bytes");
+}
+
+absl::StatusOr<xla::Future<>> PreparedRawDmaBuffer::CopyDtoH(
+    void* dst_host_ptr, int64_t offset, int64_t transfer_size) const {
+  TT_RET_CHECK(holder_ != nullptr && holder_->raw_buffer != nullptr,
+               error::kFailedPrecondition)
+      << "PreparedRawDmaBuffer is not initialized.";
+  TT_RET_CHECK(dst_host_ptr != nullptr, error::kInvalidArgument)
+      << "dst_host_ptr must not be null.";
+  TT_RET_CHECK(offset >= 0 && transfer_size >= 0, error::kInvalidArgument)
+      << "offset and transfer_size must be non-negative.";
   TT_RET_CHECK(  // ERROR_COV_INFEASIBLE=initialization condition
-      ctx.extension->PJRT_RawBuffer_CopyRawDeviceToHost != nullptr,
+      holder_->extension->PJRT_RawBuffer_CopyRawDeviceToHost != nullptr,
       error::kUnavailable)
       << "PJRT_RawBuffer_CopyRawDeviceToHost not implemented.";
 
   PJRT_RawBuffer_CopyRawDeviceToHost_Args args;
   args.struct_size = PJRT_RawBuffer_CopyRawDeviceToHost_Args_STRUCT_SIZE;
   args.extension_start = nullptr;
-  args.buffer = ctx.raw_buffer;
+  args.buffer = holder_->raw_buffer;
   args.dst = dst_host_ptr;
-  args.offset = 0;
-  args.transfer_size = copy_bytes;
+  args.offset = offset;
+  args.transfer_size = transfer_size;
   args.event = nullptr;
 
-  PJRT_Error* error = ctx.extension->PJRT_RawBuffer_CopyRawDeviceToHost(&args);
+  PJRT_Error* error =
+      holder_->extension->PJRT_RawBuffer_CopyRawDeviceToHost(&args);
   if (error) {
-    return AdaptXlaError(pjrt::PjrtErrorToStatus(error, ctx.c_api),
+    return AdaptXlaError(pjrt::PjrtErrorToStatus(error, holder_->c_api),
                          "PJRT CopyRawDeviceToHost invocation failed");
   }
 
-  xla::Future<> future = pjrt::ConvertCEventToCppFuture(args.event, ctx.c_api);
-  return AsyncDmaResult{std::move(future), std::move(ctx.hold)};
+  xla::Future<> raw_future =
+      pjrt::ConvertCEventToCppFuture(args.event, holder_->c_api);
+  auto [promise, result_future] = xla::MakePromise<void>();
+  raw_future.OnReady(
+      [promise = std::move(promise), holder = holder_](absl::Status s) mutable {
+        holder.reset();
+        if (!s.ok()) {
+          promise.Set(AdaptXlaError(s, "CopyDtoH"));
+        } else {
+          promise.Set(absl::OkStatus());
+        }
+      });
+  return std::move(result_future);
 }
 
-absl::StatusOr<AsyncDmaResult> TpuAsyncDmaCopyHtoD(
-    const void* src_host_ptr, const DeviceBufferRef& dst_buffer_ref,
-    int64_t dst_byte_offset, int64_t copy_bytes) {
-  TT_ASSIGN_OR_RETURN(auto ctx, PrepareRawBuffer(dst_buffer_ref));
+absl::StatusOr<xla::Future<>> PreparedRawDmaBuffer::CopyHtoD(
+    const void* src_host_ptr, int64_t offset, int64_t transfer_size) const {
+  TT_RET_CHECK(holder_ != nullptr && holder_->raw_buffer != nullptr,
+               error::kFailedPrecondition)
+      << "PreparedRawDmaBuffer is not initialized.";
+  TT_RET_CHECK(src_host_ptr != nullptr, error::kInvalidArgument)
+      << "src_host_ptr must not be null.";
+  TT_RET_CHECK(offset >= 0 && transfer_size >= 0, error::kInvalidArgument)
+      << "offset and transfer_size must be non-negative.";
   TT_RET_CHECK(  // ERROR_COV_INFEASIBLE=initialization condition
-      ctx.extension->PJRT_RawBuffer_CopyRawHostToDevice != nullptr,
+      holder_->extension->PJRT_RawBuffer_CopyRawHostToDevice != nullptr,
       error::kUnavailable)
       << "PJRT_RawBuffer_CopyRawHostToDevice not implemented.";
 
   PJRT_RawBuffer_CopyRawHostToDevice_Args args;
   args.struct_size = PJRT_RawBuffer_CopyRawHostToDevice_Args_STRUCT_SIZE;
   args.extension_start = nullptr;
-  args.buffer = ctx.raw_buffer;
+  args.buffer = holder_->raw_buffer;
   args.src = src_host_ptr;
-  args.offset = dst_byte_offset;
-  args.transfer_size = copy_bytes;
+  args.offset = offset;
+  args.transfer_size = transfer_size;
   args.event = nullptr;
 
-  PJRT_Error* error = ctx.extension->PJRT_RawBuffer_CopyRawHostToDevice(&args);
+  PJRT_Error* error =
+      holder_->extension->PJRT_RawBuffer_CopyRawHostToDevice(&args);
   if (error) {
-    return AdaptXlaError(pjrt::PjrtErrorToStatus(error, ctx.c_api),
+    return AdaptXlaError(pjrt::PjrtErrorToStatus(error, holder_->c_api),
                          "PJRT CopyRawHostToDevice invocation failed");
   }
 
-  xla::Future<> future = pjrt::ConvertCEventToCppFuture(args.event, ctx.c_api);
-  return AsyncDmaResult{std::move(future), std::move(ctx.hold)};
+  xla::Future<> raw_future =
+      pjrt::ConvertCEventToCppFuture(args.event, holder_->c_api);
+  auto [promise, result_future] = xla::MakePromise<void>();
+  raw_future.OnReady(
+      [promise = std::move(promise), holder = holder_](absl::Status s) mutable {
+        holder.reset();
+        if (!s.ok()) {
+          promise.Set(AdaptXlaError(s, "CopyHtoD"));
+        } else {
+          promise.Set(absl::OkStatus());
+        }
+      });
+  return std::move(result_future);
+}
+
+absl::StatusOr<xla::Future<>> TpuAsyncDmaCopyDtoH(
+    const DeviceBufferRef& src_buffer_ref, void* dst_host_ptr,
+    int64_t copy_bytes) {
+  TT_ASSIGN_OR_RETURN(PreparedRawDmaBuffer prepared,
+                      PreparedRawDmaBuffer::Prepare(src_buffer_ref));
+  return prepared.CopyDtoH(dst_host_ptr, /*offset=*/0, copy_bytes);
+}
+
+absl::StatusOr<xla::Future<>> TpuAsyncDmaCopyHtoD(
+    const void* src_host_ptr, const DeviceBufferRef& dst_buffer_ref,
+    int64_t dst_byte_offset, int64_t copy_bytes) {
+  TT_ASSIGN_OR_RETURN(PreparedRawDmaBuffer prepared,
+                      PreparedRawDmaBuffer::Prepare(dst_buffer_ref));
+  return prepared.CopyHtoD(src_host_ptr, dst_byte_offset, copy_bytes);
 }
 
 }  // namespace torch_tpu
