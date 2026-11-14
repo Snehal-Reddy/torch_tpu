@@ -196,18 +196,36 @@ class ScanInputsCreatePlaceholdersPass:
 
   def __call__(self, graph_module: torch.fx.GraphModule) -> None:
     """Runs the create placeholders pass."""
+    # Graph.placeholder uses ph_name verbatim as node.target in the forward()
+    # signature emitted by recompile(), without sanitizing or deduplicating it.
+    used_names = {n.name for n in graph_module.graph.nodes} | {
+        n.target.lstrip("*")
+        for n in graph_module.graph.nodes
+        if n.op == "placeholder" and isinstance(n.target, str)
+    }
     seen_counts: dict[str, int] = {}
     for node in self._placeholders:
       if sym_utils.is_symint_node(node):
         sym_str = str(node.meta["val"])
-        sanitized_sym_str = re.sub(r"\W+", "_", sym_str).strip("_")
-        count = seen_counts.get(sym_str, 0)
-        seen_counts[sym_str] = count + 1
-        ph_name = (
-            f"{sanitized_sym_str}_size"
-            if count == 0
-            else f"{sanitized_sym_str}_size_{count}"
-        )
+        sanitized_sym_str = re.sub(
+            r"\W+", "_", sym_str, flags=re.ASCII
+        ).strip("_")
+        if not sanitized_sym_str:
+          sanitized_sym_str = "sym"
+        elif sanitized_sym_str[0].isdigit():
+          sanitized_sym_str = f"sym_{sanitized_sym_str}"
+        count = seen_counts.get(sanitized_sym_str, 0)
+        while True:
+          ph_name = (
+              f"{sanitized_sym_str}_size"
+              if count == 0
+              else f"{sanitized_sym_str}_size_{count}"
+          )
+          count += 1
+          if ph_name not in used_names:
+            break
+        seen_counts[sanitized_sym_str] = count
+        used_names.add(ph_name)
 
         # Create a new placeholder next to it (always create to keep
         # signature match).
