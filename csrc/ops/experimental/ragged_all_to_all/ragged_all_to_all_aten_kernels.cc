@@ -26,12 +26,12 @@
 #include "ATen/core/LegacyTypeDispatch.h"
 #include "ATen/core/TensorBody.h"
 #include "ATen/core/dispatch/Dispatcher.h"
-#include "ATen/ops/empty_like.h"
 #include "ATen/ops/zeros.h"
 #include "absl/base/no_destructor.h"
 #include "absl/base/nullability.h"
-#include "absl/log/check.h"
 #include "absl/status/statusor.h"
+#include "c10/core/SymInt.h"
+#include "c10/core/SymIntArrayRef.h"
 #include "c10/util/intrusive_ptr.h"
 #include "csrc/common/cache_key.h"
 #include "csrc/common/dtype.h"
@@ -56,7 +56,6 @@
 #include "torch/csrc/distributed/c10d/Backend.hpp"
 #include "torch/csrc/distributed/c10d/GroupRegistry.hpp"
 #include "torch/csrc/distributed/c10d/ProcessGroup.hpp"
-#include "torch/csrc/distributed/c10d/Types.hpp"
 #include "torch/headeronly/core/DeviceType.h"
 #include "torch/headeronly/core/ScalarType.h"
 
@@ -178,7 +177,7 @@ at::Tensor AtenRaggedAllToAllAutograd::forward(
     const at::Tensor& output, const at::Tensor& input_offsets,
     const at::Tensor& send_sizes, const at::Tensor& output_offsets,
     const at::Tensor& recv_sizes, std::string_view process_group_name) {
-  // Cache the operator handle to avoid string schema lookup on every call.
+  // Cache the operator handles to avoid string schema lookups on every call.
   static const absl::NoDestructor op(
       at::Dispatcher::singleton()
           .findSchemaOrThrow("tpu::_ragged_all_to_all", "")
@@ -186,30 +185,46 @@ at::Tensor AtenRaggedAllToAllAutograd::forward(
                             const at::Tensor&, const at::Tensor&,
                             const at::Tensor&, const at::Tensor&,
                             std::string_view)>());
+  static const absl::NoDestructor all_to_all_single_op(
+      at::Dispatcher::singleton()
+          .findSchemaOrThrow("_c10d_functional::all_to_all_single", "")
+          .typed<at::Tensor(const at::Tensor&, c10::SymIntArrayRef,
+                            c10::SymIntArrayRef, std::string)>());
+  static const absl::NoDestructor wait_tensor_op(
+      at::Dispatcher::singleton()
+          .findSchemaOrThrow("_c10d_functional::wait_tensor", "")
+          .typed<at::Tensor(const at::Tensor&)>());
 
   if (operand.requires_grad()) {
-    TT_ASSIGN_OR_THROW(ProcessGroupTpu* const pg,
-                       GetProcessGroupTpu(process_group_name));
+    const std::string group_name(process_group_name);
+    // Only the group size is needed here, so resolve the generic
+    // c10d::ProcessGroup instead of downcasting to ProcessGroupTpu. This keeps
+    // the autograd kernel traceable with fake process groups (e.g. on CPU).
+    // resolve_process_group throws on an unknown or destroyed group.
+    const c10::intrusive_ptr<c10d::ProcessGroup> pg =
+        c10d::resolve_process_group(group_name);
 
-    // Note: dev_output_offsets and dev_input_offsets cannot be marked const
-    // because c10d::ProcessGroup::alltoall_base takes mutable at::Tensor&
-    // references per PyTorch Backend API.
-    at::Tensor dev_output_offsets = output_offsets.device() == operand.device()
-                                        ? output_offsets
-                                        : output_offsets.to(operand.device());
-    at::Tensor dev_input_offsets = input_offsets.device() == operand.device()
-                                       ? input_offsets
-                                       : input_offsets.to(operand.device());
+    const at::Tensor dev_output_offsets =
+        output_offsets.device() == operand.device()
+            ? output_offsets
+            : output_offsets.to(operand.device());
+    const at::Tensor dev_input_offsets =
+        input_offsets.device() == operand.device()
+            ? input_offsets
+            : input_offsets.to(operand.device());
 
-    at::Tensor bwd_input_offsets = at::empty_like(dev_output_offsets);
-    at::Tensor bwd_output_offsets = at::empty_like(dev_input_offsets);
+    at::Tensor bwd_input_offsets;
+    at::Tensor bwd_output_offsets;
 
     if (pg->getSize() <= 1) {
       bwd_input_offsets = dev_output_offsets.clone();
       bwd_output_offsets = dev_input_offsets.clone();
     } else {
-      std::vector<int64_t> empty_split_sizes;  // INT_VEC_OK
-      const c10d::AllToAllOptions opts;
+      // Explicit split sizes (1 int32 per peer rank). An empty list would make
+      // all_to_all_single (both its Meta and eager kernels) produce a
+      // [0]-shaped output.
+      const std::vector<c10::SymInt> equal_splits(pg->getSize(),
+                                                  c10::SymInt(1));
 
       // In the backward pass, gradients flow in the reverse direction of the
       // forward pass. If rank i sent tokens to rank j in forward:
@@ -232,18 +247,22 @@ at::Tensor AtenRaggedAllToAllAutograd::forward(
       //   bwd_input_offsets[j] on rank i  = forward output_offsets[i] on rank j
       //   bwd_output_offsets[j] on rank i = forward input_offsets[i] on rank j
       //
-      // We achieve this transposition directly on TPU using an equal-splits
-      // alltoall_base (1 int32 per peer rank):
-      //   - In alltoall_base, rank i sends element j of its tensor to rank j,
-      //     and receives element i from rank j into position j of the output.
+      // We achieve this transposition with an equal-splits
+      // _c10d_functional::all_to_all_single (1 int32 per peer rank), dispatched
+      // through the c10 Dispatcher so it is traceable by torch.compile:
+      //   - Rank i sends element j of its tensor to rank j, and receives
+      //     element i from rank j into position j of the output.
       //   - Transposing dev_output_offsets across ranks produces
-      //   bwd_input_offsets.
+      //     bwd_input_offsets.
       //   - Transposing dev_input_offsets across ranks produces
-      //   bwd_output_offsets.
-      pg->alltoall_base(bwd_input_offsets, dev_output_offsets,
-                        empty_split_sizes, empty_split_sizes, opts);
-      pg->alltoall_base(bwd_output_offsets, dev_input_offsets,
-                        empty_split_sizes, empty_split_sizes, opts);
+      //     bwd_output_offsets.
+      // Each result is passed through wait_tensor so that everything reading
+      // the offsets (save_for_backward, backward) depends on the completed
+      // collective in the traced graph, not on the in-flight tensor.
+      bwd_input_offsets = wait_tensor_op->call(all_to_all_single_op->call(
+          dev_output_offsets, equal_splits, equal_splits, group_name));
+      bwd_output_offsets = wait_tensor_op->call(all_to_all_single_op->call(
+          dev_input_offsets, equal_splits, equal_splits, group_name));
     }
 
     ctx->save_for_backward(
@@ -251,7 +270,7 @@ at::Tensor AtenRaggedAllToAllAutograd::forward(
     ctx->saved_data["operand_sizes"] = operand.sizes().vec();  // VEC_OK
     ctx->saved_data["operand_scalar_type"] =
         static_cast<int64_t>(operand.scalar_type());
-    ctx->saved_data["process_group_name"] = std::string(process_group_name);
+    ctx->saved_data["process_group_name"] = group_name;
   }
 
   at::AutoDispatchBelowADInplaceOrView guard;
