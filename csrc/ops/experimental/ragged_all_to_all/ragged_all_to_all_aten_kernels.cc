@@ -267,7 +267,7 @@ at::Tensor AtenRaggedAllToAllAutograd::forward(
 
     ctx->save_for_backward(
         {bwd_input_offsets, send_sizes, bwd_output_offsets, recv_sizes});
-    ctx->saved_data["operand_sizes"] = operand.sizes().vec();  // VEC_OK
+    ctx->saved_data["operand_sizes"] = operand.sym_sizes().vec();  // VEC_OK
     ctx->saved_data["operand_scalar_type"] =
         static_cast<int64_t>(operand.scalar_type());
     ctx->saved_data["process_group_name"] = group_name;
@@ -301,7 +301,7 @@ torch::autograd::variable_list AtenRaggedAllToAllAutograd::backward(
   const at::Tensor& bwd_output_offsets = saved[2];
   const at::Tensor& recv_sizes = saved[3];
 
-  const auto operand_sizes = ctx->saved_data["operand_sizes"].toIntVector();
+  const auto operand_sizes = ctx->saved_data["operand_sizes"].toSymIntVector();
   const auto operand_scalar_type = static_cast<at::ScalarType>(
       ctx->saved_data["operand_scalar_type"].toInt());
   const std::string& process_group_name =
@@ -309,7 +309,7 @@ torch::autograd::variable_list AtenRaggedAllToAllAutograd::backward(
 
   const at::Tensor& grad_output = grad_outputs[0];
 
-  at::Tensor grad_operand_template = at::zeros(
+  at::Tensor grad_operand_template = at::zeros_symint(
       operand_sizes, grad_output.options().dtype(operand_scalar_type));
 
   // The backward pass performs reverse ragged all-to-all communication:

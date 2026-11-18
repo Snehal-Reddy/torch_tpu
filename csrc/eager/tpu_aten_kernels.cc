@@ -1746,7 +1746,7 @@ TORCH_LIBRARY_IMPL(tpu, Meta, m) {
           const at::Tensor& input_offsets, const at::Tensor& send_sizes,
           const at::Tensor& output_offsets, const at::Tensor& recv_sizes,
           std::string_view process_group_name, at::Tensor& out) -> at::Tensor& {
-        at::native::resize_output(out, output.sizes());
+        at::native::resize_output_symint(out, output.sym_sizes());
         return out;
       });
   ImplInternal<OpName::kTorchTpuOptimizationBarrier>(
