@@ -39,6 +39,7 @@ COLLECTIVE_OPS = (
 # torch.ops.tpu attributes at import time.
 _TPU_COLLECTIVE_NAMES = frozenset({
     "tpu::_all_gather_dim",
+    "tpu::_ragged_all_to_all",
     "tpu::_reduce_scatter_dim",
 })
 

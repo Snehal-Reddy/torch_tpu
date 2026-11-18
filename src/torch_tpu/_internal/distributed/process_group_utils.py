@@ -214,21 +214,27 @@ def _extract_process_group_id_from_node(
   group: Any = None
   if "group_name" in node.kwargs:
     group = node.kwargs["group_name"]
+  elif "process_group_name" in node.kwargs:
+    group = node.kwargs["process_group_name"]
   elif "group" in node.kwargs:
     group = node.kwargs["group"]
   else:
     # When arguments are passed positionally in node.args, their position
     # differs per collective op (e.g. index 2 for all_reduce, index 3 for
-    # reduce_scatter_tensor). Inspecting schema.arguments allows dynamically
-    # locating the 'group_name' or 'group' parameter for any collective op
-    # overload.
+    # reduce_scatter_tensor, index 6 for _ragged_all_to_all). Inspecting
+    # schema.arguments allows dynamically locating the group parameter for any
+    # collective op overload.
     schema = getattr(node.target, "_schema", None)
     if schema is None and hasattr(collective_op, "default"):
       schema = getattr(collective_op.default, "_schema", None)
 
     if schema is not None:
       for idx, arg in enumerate(schema.arguments):
-        if arg.name in ("group_name", "group") and idx < len(node.args):
+        if arg.name in (
+            "group_name",
+            "process_group_name",
+            "group",
+        ) and idx < len(node.args):
           group = node.args[idx]
           break
 
